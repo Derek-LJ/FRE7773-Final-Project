@@ -5,14 +5,13 @@ Lead 期货数据准备模块
 1. 数据清洗和预处理
 2. 特征工程（技术指标、滞后特征等）
 3. 目标变量创建
-4. 数据分割（训练/验证/测试）
-5. 数据保存和加载
+4. 数据保存和加载
 """
 
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from typing import Tuple, Optional, Dict, Any
+from typing import Optional, Dict, Any
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -157,99 +156,105 @@ def clean_data(df: pd.DataFrame) -> pd.DataFrame:
     return df_clean
 
 
-def create_features(df: pd.DataFrame, 
-                   ma_windows: list = [5, 10, 20, 50, 100, 200],
-                   return_lags: list = [1, 2, 3, 5, 10],
-                   volatility_windows: list = [5, 10, 20]) -> pd.DataFrame:
+def create_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    创建技术指标特征
+    创建技术指标特征（简化版 - 仅包含指定特征）
+    
+    特征列表:
+    1. 1-day return
+    2. 7-day return
+    3. 14-day return
+    4. 7-day volatility
+    5. 14-day volatility
+    6. 21-day volatility
+    7. Volume (log-scaled)
+    8. Volume change %
+    9. Price / MA7
+    10. Price / MA30
+    11. MA14 / MA30
+    12. RSI
+    13. MACD oscillator
+    14. BB band (position)
     
     参数:
         df: 清洗后的 DataFrame
-        ma_windows: 移动平均窗口列表
-        return_lags: 收益率滞后阶数列表
-        volatility_windows: 波动率计算窗口列表
     
     返回:
         包含特征的 DataFrame
     """
     df_features = df.copy()
     
-    # 1. 基础收益率
-    df_features['Returns'] = df_features['Close'].pct_change()
-    df_features['Log_Returns'] = np.log(df_features['Close'] / df_features['Close'].shift(1))
+    # 1. Returns (1-day, 7-day, 14-day)
+    df_features['Returns_1d'] = df_features['Close'].pct_change(1)  # 1-day return
+    df_features['Returns_7d'] = df_features['Close'].pct_change(7)  # 7-day return
+    df_features['Returns_14d'] = df_features['Close'].pct_change(14)  # 14-day return
     
-    # 2. 移动平均线
-    for window in ma_windows:
-        df_features[f'MA_{window}'] = df_features['Close'].rolling(window=window).mean()
-        # 价格相对均线的偏离
-        df_features[f'Price_MA_{window}_Ratio'] = df_features['Close'] / df_features[f'MA_{window}'] - 1
+    # 2. Volatility (7-day, 14-day, 21-day)
+    # Use Returns_1d to calculate rolling volatility
+    df_features['Volatility_7d'] = df_features['Returns_1d'].rolling(window=7).std() * np.sqrt(252)
+    df_features['Volatility_14d'] = df_features['Returns_1d'].rolling(window=14).std() * np.sqrt(252)
+    df_features['Volatility_21d'] = df_features['Returns_1d'].rolling(window=21).std() * np.sqrt(252)
     
-    # 3. 指数移动平均
-    for window in [12, 26]:
-        df_features[f'EMA_{window}'] = df_features['Close'].ewm(span=window, adjust=False).mean()
+    # 3. Moving Averages (for ratios)
+    df_features['MA_7'] = df_features['Close'].rolling(window=7).mean()
+    df_features['MA_14'] = df_features['Close'].rolling(window=14).mean()
+    df_features['MA_30'] = df_features['Close'].rolling(window=30).mean()
     
-    # MACD 指标
-    if 'EMA_12' in df_features.columns and 'EMA_26' in df_features.columns:
-        df_features['MACD'] = df_features['EMA_12'] - df_features['EMA_26']
-        df_features['MACD_Signal'] = df_features['MACD'].ewm(span=9, adjust=False).mean()
-        df_features['MACD_Hist'] = df_features['MACD'] - df_features['MACD_Signal']
+    # 4. Price / MA ratios
+    df_features['Price_MA7_Ratio'] = df_features['Close'] / df_features['MA_7']
+    df_features['Price_MA30_Ratio'] = df_features['Close'] / df_features['MA_30']
     
-    # 4. RSI 指标
+    # 5. MA14 / MA30 ratio
+    df_features['MA14_MA30_Ratio'] = df_features['MA_14'] / df_features['MA_30']
+    
+    # 6. RSI (14-day)
     delta = df_features['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df_features['RSI'] = 100 - (100 / (1 + rs))
     
-    # 5. 布林带
+    # 7. MACD oscillator (EMA12 - EMA26)
+    df_features['EMA_12'] = df_features['Close'].ewm(span=12, adjust=False).mean()
+    df_features['EMA_26'] = df_features['Close'].ewm(span=26, adjust=False).mean()
+    df_features['MACD'] = df_features['EMA_12'] - df_features['EMA_26']
+    
+    # 8. Bollinger Bands (BB Position - position within the band)
     df_features['BB_Middle'] = df_features['Close'].rolling(window=20).mean()
     bb_std = df_features['Close'].rolling(window=20).std()
     df_features['BB_Upper'] = df_features['BB_Middle'] + 2 * bb_std
     df_features['BB_Lower'] = df_features['BB_Middle'] - 2 * bb_std
-    df_features['BB_Width'] = (df_features['BB_Upper'] - df_features['BB_Lower']) / df_features['BB_Middle']
     df_features['BB_Position'] = (df_features['Close'] - df_features['BB_Lower']) / (df_features['BB_Upper'] - df_features['BB_Lower'])
     
-    # 6. 波动率
-    for window in volatility_windows:
-        df_features[f'Volatility_{window}'] = df_features['Returns'].rolling(window=window).std() * np.sqrt(252)
-    
-    # 7. 价格变化特征
-    df_features['High_Low_Ratio'] = df_features['High'] / df_features['Low'] - 1
-    df_features['Close_Open_Ratio'] = df_features['Close'] / df_features['Open'] - 1
-    df_features['High_Close_Ratio'] = df_features['High'] / df_features['Close'] - 1
-    df_features['Low_Close_Ratio'] = df_features['Low'] / df_features['Close'] - 1
-    
-    # 8. 滚动最高/最低
-    for window in [5, 10, 20]:
-        df_features[f'High_{window}'] = df_features['High'].rolling(window=window).max()
-        df_features[f'Low_{window}'] = df_features['Low'].rolling(window=window).min()
-        df_features[f'Close_High_{window}_Ratio'] = df_features['Close'] / df_features[f'High_{window}'] - 1
-        df_features[f'Close_Low_{window}_Ratio'] = df_features['Close'] / df_features[f'Low_{window}'] - 1
-    
-    # 9. 滞后收益率特征
-    for lag in return_lags:
-        df_features[f'Returns_Lag_{lag}'] = df_features['Returns'].shift(lag)
-    
-    # 10. 成交量相关特征（如果有成交量数据）
+    # 9. Volume features (if Volume column exists)
     if 'Volume' in df_features.columns:
-        df_features['Volume_MA_20'] = df_features['Volume'].rolling(window=20).mean()
-        df_features['Volume_Ratio'] = df_features['Volume'] / df_features['Volume_MA_20']
-        df_features['Price_Volume'] = df_features['Close'] * df_features['Volume']
+        # Volume (log-scaled) - add small value to avoid log(0)
+        df_features['Volume_Log'] = np.log(df_features['Volume'] + 1)
+        # Volume change %
+        df_features['Volume_Change_Pct'] = df_features['Volume'].pct_change()
+    else:
+        df_features['Volume_Log'] = np.nan
+        df_features['Volume_Change_Pct'] = np.nan
     
-    # 11. 时间特征
-    df_features['Year'] = df_features.index.year
-    df_features['Month'] = df_features.index.month
-    df_features['DayOfWeek'] = df_features.index.dayofweek
-    df_features['DayOfMonth'] = df_features.index.day
+    # Keep only the required features plus original price/volume columns for reference
+    # We'll keep the original columns (Close, Open, High, Low, Volume, Change_Pct) 
+    # and the new features, but remove intermediate calculation columns
+    columns_to_keep = [
+        'Close', 'Open', 'High', 'Low', 'Volume', 'Change_Pct',  # Original columns
+        'Returns_1d', 'Returns_7d', 'Returns_14d',  # Returns
+        'Volatility_7d', 'Volatility_14d', 'Volatility_21d',  # Volatility
+        'Volume_Log', 'Volume_Change_Pct',  # Volume features
+        'Price_MA7_Ratio', 'Price_MA30_Ratio', 'MA14_MA30_Ratio',  # MA ratios
+        'RSI', 'MACD', 'BB_Position'  # Technical indicators
+    ]
     
-    # 12. 趋势特征
-    df_features['Trend_5'] = (df_features['Close'] > df_features['Close'].shift(5)).astype(int)
-    df_features['Trend_10'] = (df_features['Close'] > df_features['Close'].shift(10)).astype(int)
-    df_features['Trend_20'] = (df_features['Close'] > df_features['Close'].shift(20)).astype(int)
+    # Select only the columns that exist
+    available_columns = [col for col in columns_to_keep if col in df_features.columns]
+    df_features = df_features[available_columns]
     
     print(f"特征创建完成: {df_features.shape}")
     print(f"特征数量: {len(df_features.columns)}")
+    print(f"特征列表: {[col for col in df_features.columns if col not in ['Close', 'Open', 'High', 'Low', 'Volume', 'Change_Pct']]}")
     
     return df_features
 
@@ -289,41 +294,6 @@ def create_targets(df: pd.DataFrame,
     return df_targets
 
 
-def split_data(df: pd.DataFrame,
-              train_ratio: float = 0.7,
-              val_ratio: float = 0.15,
-              test_ratio: float = 0.15) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    按时间顺序分割数据
-    
-    参数:
-        df: 完整数据集
-        train_ratio: 训练集比例
-        val_ratio: 验证集比例
-        test_ratio: 测试集比例
-    
-    返回:
-        (train_df, val_df, test_df)
-    """
-    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, "比例之和必须为 1"
-    
-    n = len(df)
-    train_end = int(n * train_ratio)
-    val_end = int(n * (train_ratio + val_ratio))
-    
-    train_df = df.iloc[:train_end].copy()
-    val_df = df.iloc[train_end:val_end].copy()
-    test_df = df.iloc[val_end:].copy()
-    
-    print(f"数据分割完成:")
-    print(f"  训练集: {len(train_df)} 条 ({len(train_df)/n:.1%})")
-    print(f"  验证集: {len(val_df)} 条 ({len(val_df)/n:.1%})")
-    print(f"  测试集: {len(test_df)} 条 ({len(test_df)/n:.1%})")
-    print(f"  训练集日期范围: {train_df.index.min()} 至 {train_df.index.max()}")
-    print(f"  验证集日期范围: {val_df.index.min()} 至 {val_df.index.max()}")
-    print(f"  测试集日期范围: {test_df.index.min()} 至 {test_df.index.max()}")
-    
-    return train_df, val_df, test_df
 
 
 def remove_nan_rows(df: pd.DataFrame, 
@@ -357,25 +327,19 @@ def remove_nan_rows(df: pd.DataFrame,
 
 def prepare_dataset(data_path: str,
                    output_dir: str = "data",
-                   train_ratio: float = 0.7,
-                   val_ratio: float = 0.15,
-                   test_ratio: float = 0.15,
                    forward_days: int = 30,
-                   save_intermediate: bool = True) -> Dict[str, pd.DataFrame]:
+                   save_intermediate: bool = True) -> pd.DataFrame:
     """
     完整的数据准备流程 - 30 天后涨跌分类任务
     
     参数:
         data_path: 原始数据文件路径
         output_dir: 输出目录
-        train_ratio: 训练集比例
-        val_ratio: 验证集比例
-        test_ratio: 测试集比例
         forward_days: 预测未来多少天的涨跌（默认 30 天）
         save_intermediate: 是否保存中间结果
     
     返回:
-        包含 train_df, val_df, test_df 的字典
+        完整的数据集 DataFrame（包含特征和目标变量）
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -385,120 +349,98 @@ def prepare_dataset(data_path: str,
     print("=" * 60)
     
     # 1. 加载原始数据
-    print("\n[1/6] 加载原始数据...")
+    print("\n[1/5] 加载原始数据...")
     df_raw = load_raw_data(data_path)
     
     # 2. 数据清洗
-    print("\n[2/6] 数据清洗...")
+    print("\n[2/5] 数据清洗...")
     df_clean = clean_data(df_raw)
     if save_intermediate:
         df_clean.to_csv(output_dir / "lead_futures_cleaned.csv")
         print(f"  已保存清洗后的数据: {output_dir / 'lead_futures_cleaned.csv'}")
     
     # 3. 创建特征
-    print("\n[3/6] 创建特征...")
+    print("\n[3/5] 创建特征...")
     df_features = create_features(df_clean)
-    if save_intermediate:
-        df_features.to_csv(output_dir / "lead_futures_with_features.csv")
-        print(f"  已保存带特征的数据: {output_dir / 'lead_futures_with_features.csv'}")
     
     # 4. 创建目标变量（30 天后涨跌分类）
-    print("\n[4/6] 创建目标变量（30 天后涨跌分类）...")
-    df_targets = create_targets(df_features, forward_days=forward_days)
+    print("\n[4/5] 创建目标变量（30 天后涨跌分类）...")
+    df_with_targets = create_targets(df_features, forward_days=forward_days)
+    
+    # 保存带特征和目标的数据
+    if save_intermediate:
+        # 重置索引以便保存 Date 列
+        df_with_targets_save = df_with_targets.reset_index()
+        df_with_targets_save.to_csv(output_dir / "lead_futures_with_features.csv", index=False)
+        print(f"  已保存带特征和目标的数据: {output_dir / 'lead_futures_with_features.csv'}")
     
     # 5. 移除 NaN 行并填充特征缺失值
-    print("\n[5/6] 移除 NaN 行并填充特征缺失值...")
-    df_final = remove_nan_rows(df_targets, target_column='Target')
+    print("\n[5/5] 移除 NaN 行并填充特征缺失值...")
+    df_final = remove_nan_rows(df_with_targets, target_column='Target')
     
-    # 6. 数据分割
-    print("\n[6/6] 数据分割...")
-    train_df, val_df, test_df = split_data(df_final, train_ratio, val_ratio, test_ratio)
-    
-    # 保存最终数据集
+    # 保存最终数据集（ready_to_train.csv）
     print("\n保存最终数据集...")
-    train_df.to_csv(output_dir / "train.csv")
-    val_df.to_csv(output_dir / "val.csv")
-    test_df.to_csv(output_dir / "test.csv")
-    
-    # 保存为 pickle 格式（更快，保留数据类型）
-    train_df.to_pickle(output_dir / "train.pkl")
-    val_df.to_pickle(output_dir / "val.pkl")
-    test_df.to_pickle(output_dir / "test.pkl")
+    df_final_save = df_final.reset_index()
+    df_final_save.to_csv(output_dir / "ready_to_train.csv", index=False)
+    print(f"  已保存最终数据集: {output_dir / 'ready_to_train.csv'}")
     
     print(f"\n数据集已保存至: {output_dir}")
+    print(f"最终数据集形状: {df_final.shape}")
     print("=" * 60)
     
-    return {
-        'train': train_df,
-        'val': val_df,
-        'test': test_df,
-        'full': df_final
-    }
+    return df_final
 
 
 def load_prepared_data(data_dir: str = "data",
-                      format: str = "pkl") -> Dict[str, pd.DataFrame]:
+                      filename: str = "ready_to_train.csv") -> pd.DataFrame:
     """
     加载已准备的数据集
     
     参数:
         data_dir: 数据目录
-        format: 文件格式 ('csv' 或 'pkl')
+        filename: 文件名（默认 'ready_to_train.csv'）
     
     返回:
-        包含 train_df, val_df, test_df 的字典
+        完整的数据集 DataFrame
     """
     data_dir = Path(data_dir)
+    filepath = data_dir / filename
     
-    if format == "pkl":
-        train_df = pd.read_pickle(data_dir / "train.pkl")
-        val_df = pd.read_pickle(data_dir / "val.pkl")
-        test_df = pd.read_pickle(data_dir / "test.pkl")
-    else:
-        train_df = pd.read_csv(data_dir / "train.csv", index_col=0, parse_dates=True)
-        val_df = pd.read_csv(data_dir / "val.csv", index_col=0, parse_dates=True)
-        test_df = pd.read_csv(data_dir / "test.csv", index_col=0, parse_dates=True)
+    if not filepath.exists():
+        raise FileNotFoundError(f"数据文件不存在: {filepath}")
     
-    print(f"成功加载数据集:")
-    print(f"  训练集: {train_df.shape}")
-    print(f"  验证集: {val_df.shape}")
-    print(f"  测试集: {test_df.shape}")
+    df = pd.read_csv(filepath, parse_dates=['Date'])
+    df = df.set_index('Date')
     
-    return {
-        'train': train_df,
-        'val': val_df,
-        'test': test_df
-    }
+    print(f"成功加载数据集: {df.shape}")
+    print(f"  日期范围: {df.index.min()} 至 {df.index.max()}")
+    
+    return df
 
 
 if __name__ == "__main__":
     # 示例用法
-    data_path = "data/lead_futures_historical_data_raw.csv"
+    data_path = "project\project\data\lead_futures_historical_data_raw.csv"
+    output_path = "project\project\data"
     
     # 准备数据集（30 天后涨跌分类任务）
-    datasets = prepare_dataset(
+    df_final = prepare_dataset(
         data_path=data_path,
-        output_dir="data",
-        train_ratio=0.7,
-        val_ratio=0.15,
-        test_ratio=0.15,
+        output_dir=output_path,
         forward_days=30,  # 预测 30 天后的涨跌
         save_intermediate=True
     )
     
     # 查看数据摘要
     print("\n数据摘要:")
-    for name, df in datasets.items():
-        if name != 'full':
-            print(f"\n{name.upper()} 集:")
-            print(f"  形状: {df.shape}")
-            print(f"  日期范围: {df.index.min()} 至 {df.index.max()}")
-            # 特征列（排除目标变量）
-            feature_cols = [c for c in df.columns if c not in ['Target', 'Target_30d_Up', 'Forward_Return_30']]
-            print(f"  特征列数: {len(feature_cols)}")
-            print(f"  目标变量: Target (30天后涨跌分类)")
-            if 'Target' in df.columns:
-                target_dist = df['Target'].value_counts()
-                print(f"    涨 (1): {target_dist.get(1, 0)} 条 ({target_dist.get(1, 0)/len(df)*100:.1f}%)")
-                print(f"    跌 (0): {target_dist.get(0, 0)} 条 ({target_dist.get(0, 0)/len(df)*100:.1f}%)")
+    print(f"  形状: {df_final.shape}")
+    print(f"  日期范围: {df_final.index.min()} 至 {df_final.index.max()}")
+    # 特征列（排除目标变量）
+    feature_cols = [c for c in df_final.columns if c not in ['Target', 'Target_30d_Up', 'Forward_Return_30']]
+    print(f"  特征列数: {len(feature_cols)}")
+    print(f"  目标变量: Target (30天后涨跌分类)")
+    if 'Target' in df_final.columns:
+        target_dist = df_final['Target'].value_counts()
+        print(f"    涨 (1): {target_dist.get(1, 0)} 条 ({target_dist.get(1, 0)/len(df_final)*100:.1f}%)")
+        print(f"    跌 (0): {target_dist.get(0, 0)} 条 ({target_dist.get(0, 0)/len(df_final)*100:.1f}%)")
 
